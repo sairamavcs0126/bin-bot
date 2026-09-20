@@ -3,7 +3,7 @@ name: Binance Scanner
 on:
   schedule:
     # Runs every 5 minutes automatically in the cloud
-    - cron: '*/30 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 jobs:
