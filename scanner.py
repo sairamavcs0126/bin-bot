@@ -3,10 +3,14 @@ import requests
 import json
 import time
 
-# Pull securely from GitHub Secrets — no credentials in plain text!
+# BOT_TOKEN pulled securely from GitHub Secrets
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-raw_chat_ids = os.getenv("CHAT_IDS", "")
-CHAT_IDS = [cid.strip() for cid in raw_chat_ids.split(",") if cid.strip()]
+
+# Chat IDs stored directly in the script
+CHAT_IDS = [
+    "5539952821",   # Your Chat ID
+    "6008188228"    
+]
 
 MIN_VOLUME_USDT = 20_000_000
 MIN_PUMP_PCT = 4.0   # +4% for long breakout
@@ -15,7 +19,7 @@ MIN_DUMP_PCT = -4.0  # -4% for sell breakdown
 IGNORE_SYMBOLS = {
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", 
     "USDCUSDT", "FDUSDUSDT", "TUSDUSDT", "BUSDUSDT", "EURUSDT", 
-    "AEURUSDT", "USD1USDT", "RLUSDUSDT", "GUSDT"
+    "AEURUSDT", "USD1USDT", "RLUSDUSDT"
 }
 
 STATE_FILE = "alerted_coins.json"
@@ -73,10 +77,11 @@ def send_telegram(symbol, vol_m, pct_change, price, signal_type):
             print(f"Network error for {chat_id}: {e}")
 
 def run():
-    if not BOT_TOKEN or not CHAT_IDS:
-        print("Missing BOT_TOKEN or CHAT_IDS in environment variables.")
+    if not BOT_TOKEN:
+        print("Error: BOT_TOKEN is missing from GitHub Secrets.")
         return
 
+    print(f"Running scan for recipients: {CHAT_IDS}")
     alerted = load_alerted()
     
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
@@ -123,6 +128,7 @@ def run():
 
     if new_alerts:
         save_alerted(alerted)
+    print("Scan finished.")
 
 if __name__ == "__main__":
     run()
