@@ -3,24 +3,22 @@ import requests
 import json
 import time
 
-# --- CONFIGURATION ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8709739410:AAEiVKTVnox-8TLO0PblGTtVPKCccYJBh9k")
 
-# Add your ID and any friend IDs here:
+# Both Telegram recipient IDs
 CHAT_IDS = [
-    "5539952821",              
-    "600818828"  
+    "5539952821",  # Your ID
+    "600818828"    # Your friend's ID
 ]
 
 MIN_VOLUME_USDT = 20_000_000
-MIN_PUMP_PCT = 4.0   # +4% for bullish breakout
+MIN_PUMP_PCT = 4.0   # +4% for long breakout
 MIN_DUMP_PCT = -4.0  # -4% for sell breakdown
 
-# Exclude permanent high-cap majors and all stablecoins/fiat
 IGNORE_SYMBOLS = {
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", 
     "USDCUSDT", "FDUSDUSDT", "TUSDUSDT", "BUSDUSDT", "EURUSDT", 
-    "AEURUSDT", "USD1USDT", "RLUSDUSDT"
+    "AEURUSDT", "USD1USDT", "RLUSDUSDT", "GUSDT"
 }
 
 STATE_FILE = "alerted_coins.json"
@@ -30,7 +28,6 @@ def load_alerted():
         try:
             with open(STATE_FILE, "r") as f:
                 data = json.load(f)
-                # Reset cache if older than 24 hours
                 if time.time() - data.get("timestamp", 0) > 86400:
                     return set()
                 return set(data.get("coins", []))
@@ -61,8 +58,7 @@ def send_telegram(symbol, vol_m, pct_change, price, signal_type):
     )
     
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    
-    # Broadcast to all registered users
+
     for chat_id in CHAT_IDS:
         payload = {
             "chat_id": chat_id,
@@ -71,13 +67,16 @@ def send_telegram(symbol, vol_m, pct_change, price, signal_type):
             "disable_web_page_preview": True
         }
         try:
-            requests.post(url, json=payload, timeout=10)
+            r = requests.post(url, json=payload, timeout=10)
+            if r.status_code == 200:
+                print(f"Delivered to {chat_id}")
+            else:
+                print(f"Telegram error for {chat_id}: {r.text}")
         except Exception as e:
-            print(f"Telegram error sending to {chat_id}: {e}")
+            print(f"Network error for {chat_id}: {e}")
 
 def run():
     alerted = load_alerted()
-    print(f"Loaded {len(alerted)} previously alerted signals from cache.")
     
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
     url = "https://data-api.binance.vision/api/v3/ticker/24hr"
@@ -85,16 +84,14 @@ def run():
     try:
         res = requests.get(url, headers=headers, timeout=15)
         if res.status_code != 200:
-            print(f"Binance Vision API returned status {res.status_code}")
+            print(f"Binance API returned {res.status_code}")
             return
         tickers = res.json()
-        print(f"Fetched {len(tickers)} tickers successfully from Binance.")
     except Exception as e:
         print(f"Fetch failed: {e}")
         return
 
     new_alerts = False
-    qualifying_count = 0
 
     for item in tickers:
         sym = item.get("symbol", "")
@@ -107,31 +104,21 @@ def run():
                 continue
 
             if vol >= MIN_VOLUME_USDT:
-                # 1. Bullish Breakout (>= +4%)
-                if pct >= MIN_PUMP_PCT:
-                    qualifying_count += 1
-                    signal_key = f"{sym}_LONG"
-                    if signal_key not in alerted:
-                        price = item.get("lastPrice", "0")
-                        send_telegram(sym, vol / 1_000_000, pct, price, "LONG")
-                        alerted.add(signal_key)
-                        new_alerts = True
-                        print(f"New LONG alert sent for {sym}")
-                        time.sleep(0.3)
+                # Bullish Breakout
+                if pct >= MIN_PUMP_PCT and f"{sym}_LONG" not in alerted:
+                    price = item.get("lastPrice", "0")
+                    send_telegram(sym, vol / 1_000_000, pct, price, "LONG")
+                    alerted.add(f"{sym}_LONG")
+                    new_alerts = True
+                    time.sleep(0.3)
 
-                # 2. Sell Breakdown (<= -4%)
-                elif pct <= MIN_DUMP_PCT:
-                    qualifying_count += 1
-                    signal_key = f"{sym}_SHORT"
-                    if signal_key not in alerted:
-                        price = item.get("lastPrice", "0")
-                        send_telegram(sym, vol / 1_000_000, pct, price, "SHORT")
-                        alerted.add(signal_key)
-                        new_alerts = True
-                        print(f"New SHORT alert sent for {sym}")
-                        time.sleep(0.3)
-
-    print(f"Scan complete. Total qualifying tickers: {qualifying_count}. New alerts triggered: {new_alerts}.")
+                # Sell Breakdown
+                elif pct <= MIN_DUMP_PCT and f"{sym}_SHORT" not in alerted:
+                    price = item.get("lastPrice", "0")
+                    send_telegram(sym, vol / 1_000_000, pct, price, "SHORT")
+                    alerted.add(f"{sym}_SHORT")
+                    new_alerts = True
+                    time.sleep(0.3)
 
     if new_alerts:
         save_alerted(alerted)
