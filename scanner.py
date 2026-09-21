@@ -3,13 +3,10 @@ import requests
 import json
 import time
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8709739410:AAEiVKTVnox-8TLO0PblGTtVPKCccYJBh9k")
-
-# Both Telegram recipient IDs
-CHAT_IDS = [
-    "5539952821",  # Your ID
-    "6008188228"    # Your friend's ID
-]
+# Pull securely from GitHub Secrets — no credentials in plain text!
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+raw_chat_ids = os.getenv("CHAT_IDS", "")
+CHAT_IDS = [cid.strip() for cid in raw_chat_ids.split(",") if cid.strip()]
 
 MIN_VOLUME_USDT = 20_000_000
 MIN_PUMP_PCT = 4.0   # +4% for long breakout
@@ -76,6 +73,10 @@ def send_telegram(symbol, vol_m, pct_change, price, signal_type):
             print(f"Network error for {chat_id}: {e}")
 
 def run():
+    if not BOT_TOKEN or not CHAT_IDS:
+        print("Missing BOT_TOKEN or CHAT_IDS in environment variables.")
+        return
+
     alerted = load_alerted()
     
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
@@ -84,7 +85,7 @@ def run():
     try:
         res = requests.get(url, headers=headers, timeout=15)
         if res.status_code != 200:
-            print(f"Binance API returned {res.status_code}")
+            print(f"Binance API returned status {res.status_code}")
             return
         tickers = res.json()
     except Exception as e:
@@ -104,7 +105,7 @@ def run():
                 continue
 
             if vol >= MIN_VOLUME_USDT:
-                # Bullish Breakout
+                # 1. Bullish Breakout
                 if pct >= MIN_PUMP_PCT and f"{sym}_LONG" not in alerted:
                     price = item.get("lastPrice", "0")
                     send_telegram(sym, vol / 1_000_000, pct, price, "LONG")
@@ -112,7 +113,7 @@ def run():
                     new_alerts = True
                     time.sleep(0.3)
 
-                # Sell Breakdown
+                # 2. Sell Breakdown
                 elif pct <= MIN_DUMP_PCT and f"{sym}_SHORT" not in alerted:
                     price = item.get("lastPrice", "0")
                     send_telegram(sym, vol / 1_000_000, pct, price, "SHORT")
