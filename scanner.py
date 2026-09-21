@@ -8,7 +8,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "8709739410:AAEiVKTVnox-8TLO0PblGTtVPKCccYJBh
 # Both Telegram recipient IDs
 CHAT_IDS = [
     "5539952821",  # Your ID
-    "600818828"    # Your friend's ID
+    "6008188228"    # Your friend's ID
 ]
 
 MIN_VOLUME_USDT = 20_000_000
