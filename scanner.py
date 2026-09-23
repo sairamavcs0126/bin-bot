@@ -7,9 +7,9 @@ from datetime import datetime, timezone
 # 1. Credentials
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# Telegram Recipient IDs
+# Telegram Recipient ID (Your chat only)
 CHAT_IDS = [
-    "5539952821"   # Friend's Chat ID
+    "5539952821"
 ]
 
 # 2. Filtering & Indicator Parameters
@@ -25,12 +25,15 @@ IGNORE_SYMBOLS = {
 
 STATE_FILE = "alerted_coins.json"
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
+
 def load_alerted():
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f:
                 data = json.load(f)
-                # Keep state clean: expire entries after 2 hours (8 candles)
                 if time.time() - data.get("timestamp", 0) > 7200:
                     return set()
                 return set(data.get("coins", []))
@@ -59,12 +62,11 @@ def calculate_bollinger_bands(closes, length=20, mult=1.0):
 def calculate_session_vwap(candles):
     """
     Calculates Daily Session-Anchored VWAP (resets at 00:00 UTC).
-    Uses 'Close' as source to strictly match your Pine Script configuration.
+    Uses 'Close' as source to match your Pine Script configuration.
     """
     if not candles:
         return None
     
-    # Identify the UTC day of the setup candle
     latest_ts = candles[-1]["open_time"] / 1000
     latest_day = datetime.fromtimestamp(latest_ts, tz=timezone.utc).date()
     
@@ -75,7 +77,6 @@ def calculate_session_vwap(candles):
         c_ts = c["open_time"] / 1000
         c_day = datetime.fromtimestamp(c_ts, tz=timezone.utc).date()
         
-        # Reset calculation when crossing into the same daily session
         if c_day == latest_day:
             vol = c["volume"]
             price = c["close"]
@@ -102,10 +103,10 @@ def send_telegram(text):
             pass
 
 def scan_symbol(symbol):
-    """Fetches 15m candles from Binance Perpetual Futures and evaluates setup."""
-    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=15m&limit=100"
+    """Fetches 15m candles from Binance Perpetual Futures (via public data edge)."""
+    url = f"https://fapi.binance.vision/fapi/v1/klines?symbol={symbol}&interval=15m&limit=100"
     try:
-        r = requests.get(url, timeout=6)
+        r = requests.get(url, headers=HEADERS, timeout=6)
         if r.status_code != 200:
             return None
         raw_candles = r.json()
@@ -113,7 +114,7 @@ def scan_symbol(symbol):
             return None
             
         candles = []
-        # Exclude the last unfinished candle (raw_candles[-1]); evaluate on closed bar
+        # Exclude the current open candle; evaluate on the completed bar
         for c in raw_candles[:-1]:
             candles.append({
                 "open_time": int(c[0]),
@@ -124,7 +125,6 @@ def scan_symbol(symbol):
                 "volume": float(c[5])
             })
             
-        # Target completed 15m candle
         target = candles[-1]
         closes = [c["close"] for c in candles]
         
@@ -134,13 +134,13 @@ def scan_symbol(symbol):
         if None in (basis, upper_bb, lower_bb, vwap):
             return None
             
-        # Pre-condition: VWAP must sit inside the Bollinger Bands
+        # Pre-condition: VWAP inside Bollinger Bands
         if not (lower_bb < vwap < upper_bb):
             return None
             
         o, h, l, c = target["open"], target["high"], target["low"], target["close"]
         
-        # 🔴 SELL SIGNAL: Reached upper band / above VWAP, then broke lower band
+        # 🔴 SELL SIGNAL: High reached upper band / above VWAP, then broke lower band
         if (h > vwap and h <= upper_bb) and (c < lower_bb or l < lower_bb):
             return {
                 "signal": "SELL",
@@ -151,7 +151,7 @@ def scan_symbol(symbol):
                 "lower_bb": lower_bb
             }
             
-        # 🟢 BUY SIGNAL: Reached lower band / below VWAP, then broke upper band
+        # 🟢 BUY SIGNAL: Low reached lower band / below VWAP, then broke upper band
         if (l < vwap and l >= lower_bb) and (c > upper_bb or h > upper_bb):
             return {
                 "signal": "BUY",
@@ -173,10 +173,10 @@ def run():
 
     alerted = load_alerted()
     
-    # 1. Fetch Binance USDT Perpetual Futures 24h Tickers
-    url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+    # Unrestricted Binance Vision endpoint for Perpetual Futures
+    url = "https://fapi.binance.vision/fapi/v1/ticker/24hr"
     try:
-        res = requests.get(url, timeout=12)
+        res = requests.get(url, headers=HEADERS, timeout=12)
         if res.status_code != 200:
             send_telegram(f"⚠️ <b>Futures API Warning:</b> Binance returned status {res.status_code}.")
             return
@@ -195,9 +195,8 @@ def run():
             except (ValueError, TypeError):
                 continue
                 
-            # Filter for liquidity
             if quote_vol >= MIN_24H_VOLUME_USDT:
-                time.sleep(0.04)  # Rate limiting protection
+                time.sleep(0.04)  # Prevent rate limits
                 result = scan_symbol(sym)
                 
                 if result:
