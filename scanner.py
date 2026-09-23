@@ -103,8 +103,8 @@ def send_telegram(text):
             pass
 
 def scan_symbol(symbol):
-    """Fetches 15m candles from Binance Perpetual Futures (via public data edge)."""
-    url = f"https://fapi.binance.vision/fapi/v1/klines?symbol={symbol}&interval=15m&limit=100"
+    """Fetches 15m candles from Binance public Vision API."""
+    url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval=15m&limit=100"
     try:
         r = requests.get(url, headers=HEADERS, timeout=6)
         if r.status_code != 200:
@@ -173,16 +173,16 @@ def run():
 
     alerted = load_alerted()
     
-    # Unrestricted Binance Vision endpoint for Perpetual Futures
-    url = "https://fapi.binance.vision/fapi/v1/ticker/24hr"
+    # Unrestricted Binance Vision endpoint for market tickers
+    url = "https://data-api.binance.vision/api/v3/ticker/24hr"
     try:
         res = requests.get(url, headers=HEADERS, timeout=12)
         if res.status_code != 200:
-            send_telegram(f"⚠️ <b>Futures API Warning:</b> Binance returned status {res.status_code}.")
+            send_telegram(f"⚠️ <b>API Warning:</b> Binance returned status {res.status_code}.")
             return
         tickers = res.json()
     except Exception as e:
-        send_telegram(f"⚠️ <b>Scanner Error:</b> Failed to fetch Binance Futures tickers: {e}")
+        send_telegram(f"⚠️ <b>Scanner Error:</b> Failed to fetch Binance tickers: {e}")
         return
 
     triggered_count = 0
@@ -227,7 +227,7 @@ def run():
                         triggered_count += 1
 
     if triggered_count == 0:
-        status_msg = "ℹ️ <b>Market Scanner:</b> 15m Futures scan completed. No coins currently matching BB/VWAP traversal criteria."
+        status_msg = "ℹ️ <b>Market Scanner:</b> 15m scan completed. No coins currently matching BB/VWAP traversal criteria."
         send_telegram(status_msg)
     else:
         save_alerted(alerted)
