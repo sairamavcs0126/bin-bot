@@ -2,22 +2,20 @@ import os
 import requests
 import json
 import time
+from datetime import datetime, timezone
 
+# 1. Credentials
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# Recipient Telegram IDs
+# Telegram Recipient IDs
 CHAT_IDS = [
-    "5539952821",   # Your Chat ID
-    "6008188228"    # Friend's Chat ID
+    "5539952821"   # Friend's Chat ID
 ]
 
-# --- SCANNER CRITERIA ---
-MIN_VOLUME_24H_USDT = 40_000_000   # 40M+ USDT 24h turnover
-MIN_PUMP_24H_PCT = 4.0              # +6% 24h gain
-MIN_DUMP_24H_PCT = -3.0             # -6% 24h drop
-
-MIN_1H_PCT = 2.5                    # 2.5% move in current 1h candle
-MIN_RVOL = 1.8                      # 1h volume >= 1.8x normal pace
+# 2. Filtering & Indicator Parameters
+MIN_24H_VOLUME_USDT = 15_000_000   # 15M USDT threshold to filter out dead pairs
+BB_LENGTH = 20                     # 20-period Bollinger Bands
+BB_MULT = 1.0                      # 1.0 Standard Deviation
 
 IGNORE_SYMBOLS = {
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", 
@@ -32,7 +30,8 @@ def load_alerted():
         try:
             with open(STATE_FILE, "r") as f:
                 data = json.load(f)
-                if time.time() - data.get("timestamp", 0) > 14400:
+                # Keep state clean: expire entries after 2 hours (8 candles)
+                if time.time() - data.get("timestamp", 0) > 7200:
                     return set()
                 return set(data.get("coins", []))
         except Exception:
@@ -43,32 +42,50 @@ def save_alerted(coins):
     with open(STATE_FILE, "w") as f:
         json.dump({"timestamp": time.time(), "coins": list(coins)}, f)
 
-def check_1h_momentum(symbol, quote_vol_24h):
-    url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval=1h&limit=2"
-    try:
-        r = requests.get(url, timeout=5)
-        if r.status_code != 200:
-            return None
-        candles = r.json()
-        if len(candles) < 2:
-            return None
+def calculate_bollinger_bands(closes, length=20, mult=1.0):
+    """Calculates 20-SMA Basis, Upper, and Lower Bollinger Bands (1.0 StdDev)."""
+    if len(closes) < length:
+        return None, None, None
+    
+    slice_c = closes[-length:]
+    basis = sum(slice_c) / length
+    variance = sum((x - basis) ** 2 for x in slice_c) / length
+    stdev = variance ** 0.5
+    
+    upper = basis + (mult * stdev)
+    lower = basis - (mult * stdev)
+    return basis, upper, lower
 
-        cur = candles[-1]
-        open_p = float(cur[1])
-        close_p = float(cur[4])
-        vol_quote_1h = float(cur[7])
-
-        change_1h = ((close_p - open_p) / open_p) * 100
-        avg_hourly_vol = quote_vol_24h / 24.0
-        rvol = vol_quote_1h / avg_hourly_vol if avg_hourly_vol > 0 else 0
-
-        return {
-            "change_1h": change_1h,
-            "rvol": rvol,
-            "last_price": close_p
-        }
-    except Exception:
+def calculate_session_vwap(candles):
+    """
+    Calculates Daily Session-Anchored VWAP (resets at 00:00 UTC).
+    Uses 'Close' as source to strictly match your Pine Script configuration.
+    """
+    if not candles:
         return None
+    
+    # Identify the UTC day of the setup candle
+    latest_ts = candles[-1]["open_time"] / 1000
+    latest_day = datetime.fromtimestamp(latest_ts, tz=timezone.utc).date()
+    
+    cum_vol = 0.0
+    cum_pv = 0.0
+    
+    for c in candles:
+        c_ts = c["open_time"] / 1000
+        c_day = datetime.fromtimestamp(c_ts, tz=timezone.utc).date()
+        
+        # Reset calculation when crossing into the same daily session
+        if c_day == latest_day:
+            vol = c["volume"]
+            price = c["close"]
+            cum_pv += price * vol
+            cum_vol += vol
+            
+    if cum_vol == 0:
+        return None
+        
+    return cum_pv / cum_vol
 
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -84,83 +101,134 @@ def send_telegram(text):
         except Exception:
             pass
 
+def scan_symbol(symbol):
+    """Fetches 15m candles from Binance Perpetual Futures and evaluates setup."""
+    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=15m&limit=100"
+    try:
+        r = requests.get(url, timeout=6)
+        if r.status_code != 200:
+            return None
+        raw_candles = r.json()
+        if len(raw_candles) < 30:
+            return None
+            
+        candles = []
+        # Exclude the last unfinished candle (raw_candles[-1]); evaluate on closed bar
+        for c in raw_candles[:-1]:
+            candles.append({
+                "open_time": int(c[0]),
+                "open": float(c[1]),
+                "high": float(c[2]),
+                "low": float(c[3]),
+                "close": float(c[4]),
+                "volume": float(c[5])
+            })
+            
+        # Target completed 15m candle
+        target = candles[-1]
+        closes = [c["close"] for c in candles]
+        
+        basis, upper_bb, lower_bb = calculate_bollinger_bands(closes, BB_LENGTH, BB_MULT)
+        vwap = calculate_session_vwap(candles)
+        
+        if None in (basis, upper_bb, lower_bb, vwap):
+            return None
+            
+        # Pre-condition: VWAP must sit inside the Bollinger Bands
+        if not (lower_bb < vwap < upper_bb):
+            return None
+            
+        o, h, l, c = target["open"], target["high"], target["low"], target["close"]
+        
+        # 🔴 SELL SIGNAL: Reached upper band / above VWAP, then broke lower band
+        if (h > vwap and h <= upper_bb) and (c < lower_bb or l < lower_bb):
+            return {
+                "signal": "SELL",
+                "price": c,
+                "open": o, "high": h, "low": l, "close": c,
+                "vwap": vwap,
+                "upper_bb": upper_bb,
+                "lower_bb": lower_bb
+            }
+            
+        # 🟢 BUY SIGNAL: Reached lower band / below VWAP, then broke upper band
+        if (l < vwap and l >= lower_bb) and (c > upper_bb or h > upper_bb):
+            return {
+                "signal": "BUY",
+                "price": c,
+                "open": o, "high": h, "low": l, "close": c,
+                "vwap": vwap,
+                "upper_bb": upper_bb,
+                "lower_bb": lower_bb
+            }
+            
+        return None
+    except Exception:
+        return None
+
 def run():
     if not BOT_TOKEN:
-        print("Missing BOT_TOKEN.")
+        print("Missing BOT_TOKEN in environment.")
         return
 
     alerted = load_alerted()
-    headers = {"User-Agent": "Mozilla/5.0"}
-    url = "https://data-api.binance.vision/api/v3/ticker/24hr"
-
+    
+    # 1. Fetch Binance USDT Perpetual Futures 24h Tickers
+    url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
     try:
-        res = requests.get(url, headers=headers, timeout=12)
+        res = requests.get(url, timeout=12)
         if res.status_code != 200:
-            send_telegram(f"⚠️ <b>Scanner Warning:</b> Binance API returned status {res.status_code}.")
+            send_telegram(f"⚠️ <b>Futures API Warning:</b> Binance returned status {res.status_code}.")
             return
         tickers = res.json()
     except Exception as e:
-        send_telegram(f"⚠️ <b>Scanner Error:</b> Failed to fetch Binance data: {e}")
+        send_telegram(f"⚠️ <b>Scanner Error:</b> Failed to fetch Binance Futures tickers: {e}")
         return
 
     triggered_count = 0
 
     for item in tickers:
         sym = item.get("symbol", "")
-
         if sym.endswith("USDT") and sym not in IGNORE_SYMBOLS:
             try:
-                vol = float(item.get("quoteVolume", 0))
-                pct = float(item.get("priceChangePercent", 0))
+                quote_vol = float(item.get("quoteVolume", 0))
             except (ValueError, TypeError):
                 continue
-
-            if vol >= MIN_VOLUME_24H_USDT:
-                is_long_candidate = (pct >= MIN_PUMP_24H_PCT and f"{sym}_LONG" not in alerted)
-                is_short_candidate = (pct <= MIN_DUMP_24H_PCT and f"{sym}_SHORT" not in alerted)
-
-                if is_long_candidate or is_short_candidate:
-                    m = check_1h_momentum(sym, vol)
-                    time.sleep(0.05)
-
-                    if not m:
-                        continue
-
-                    # Bullish breakout alert
-                    if is_long_candidate and m["change_1h"] >= MIN_1H_PCT and m["rvol"] >= MIN_RVOL:
+                
+            # Filter for liquidity
+            if quote_vol >= MIN_24H_VOLUME_USDT:
+                time.sleep(0.04)  # Rate limiting protection
+                result = scan_symbol(sym)
+                
+                if result:
+                    sig = result["signal"]
+                    alert_key = f"{sym}_{sig}"
+                    
+                    if alert_key not in alerted:
                         tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym}.P"
+                        
+                        if sig == "BUY":
+                            header = "🟢 <b>15M BB/VWAP EXPANSION (BUY)</b>"
+                        else:
+                            header = "🔴 <b>15M BB/VWAP EXPANSION (SELL)</b>"
+                            
                         msg = (
-                            f"🟢 <b>FRESH 1H BREAKOUT</b>\n\n"
+                            f"{header}\n\n"
                             f"<b>Coin:</b> #{sym}\n"
-                            f"<b>Price:</b> ${m['last_price']}\n"
-                            f"<b>1H Move:</b> {m['change_1h']:+.2f}%\n"
-                            f"<b>1H Vol Surge:</b> {m['rvol']:.1f}x normal\n"
-                            f"<b>24h Turnover:</b> ${vol/1_000_000:.1f}M USDT ({pct:+.2f}%)\n\n"
+                            f"<b>Signal Candle Close:</b> ${result['close']}\n"
+                            f"<b>O:</b> ${result['open']} | <b>H:</b> ${result['high']} | <b>L:</b> ${result['low']}\n\n"
+                            f"<b>VWAP:</b> ${result['vwap']:.4f}\n"
+                            f"<b>Upper BB (1.0σ):</b> ${result['upper_bb']:.4f}\n"
+                            f"<b>Lower BB (1.0σ):</b> ${result['lower_bb']:.4f}\n\n"
                             f"🔗 <a href='{tv_url}'>Open Chart on TradingView</a>"
                         )
+                        
                         send_telegram(msg)
-                        alerted.add(f"{sym}_LONG")
+                        alerted.add(alert_key)
                         triggered_count += 1
 
-                    # Bearish breakdown alert
-                    elif is_short_candidate and m["change_1h"] <= -MIN_1H_PCT and m["rvol"] >= MIN_RVOL:
-                        tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym}.P"
-                        msg = (
-                            f"🔴 <b>FRESH 1H BREAKDOWN</b>\n\n"
-                            f"<b>Coin:</b> #{sym}\n"
-                            f"<b>Price:</b> ${m['last_price']}\n"
-                            f"<b>1H Move:</b> {m['change_1h']:+.2f}%\n"
-                            f"<b>1H Vol Surge:</b> {m['rvol']:.1f}x normal\n"
-                            f"<b>24h Turnover:</b> ${vol/1_000_000:.1f}M USDT ({pct:+.2f}%)\n\n"
-                            f"🔗 <a href='{tv_url}'>Open Chart on TradingView</a>"
-                        )
-                        send_telegram(msg)
-                        alerted.add(f"{sym}_SHORT")
-                        triggered_count += 1
-
-    # If no coins matched the strict criteria, notify Telegram that scan ran cleanly
     if triggered_count == 0:
-        status_msg = "ℹ️ <b>Market Scanner:</b> Active scan completed. No coins currently matching breakout/breakdown conditions."
+        status_msg = "ℹ️ <b>Market Scanner:</b> 15m Futures scan completed. No coins currently matching BB/VWAP traversal criteria."
         send_telegram(status_msg)
     else:
         save_alerted(alerted)
